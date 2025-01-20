@@ -1,0 +1,1597 @@
+---
+title: "LPOP Outcomes Analysis V6"
+author: "Sunny Tang"
+date: '2024-02-18'
+output:
+  html_document:
+    toc: true
+    theme: united
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r Setup, include=FALSE}
+### Loading packages
+
+# Data Processing:
+library(psych) #psych stats package, includes factor analysis
+library(bestNormalize) #yeojohnson and other transformations
+#library(mice) #multiple imputation
+#library(Matching) #propensity score matching
+#library(MatchIt) #simpler matching
+library(robustbase) #adjusted box plot
+library(performance) #check_outliers for mahalanobis distance, influence
+#library(NbClust) #Clustering - how many
+#library(Rtsne) #t-SNE dimensionality reduction
+
+# General Stats:
+library(effsize) #cohen d, etc.
+library(lm.beta) #standardized beta
+library(DescTools) #Fisher r to z tranformation
+library(nlme) #mixed effects
+#library(irr) # interrater correlation
+library(RVAideMemoire) #Pairwise comparisons and other stats
+library(lme4) #expands on nlme with generalized linear regressions
+#library(lavaan) #cFA, mediation analysis
+
+# Graphing
+library(gridExtra) #arranges ggplot grobs
+library(Hmisc) #works with ggplot and others
+library(corrplot) # correlation plots
+library(ggpubr) #pairwise and statistics for ggplot
+#library(hexbin) #Binning and plotting functions for hexagonal bins - network
+#library(networkD3) #Creates D3 JavaScript network, tree, dendrogram graphs from R.
+#library(tidytext) #Text mining
+library(plotly) #Interactive graphs + 3d graphs
+#library(repr)#String and binary representations - Network
+library(RColorBrewer)
+library(ggthemes) #Preset themes for ggplot
+
+# Machine Learning and Modeling
+library(car) #companion to applied regression
+library(glmnet) #lasso and elastic net
+library(caret) #ML methods
+library(ROCR) #ROC curve
+
+# Standard Packages (all projects)
+library(plyr) #data manipulations
+library(naniar) #na functions
+library(arsenal) #tableby
+library(tidyverse) #dplyr, ggplot, stringr, et al
+
+set.seed(123)
+
+### Loading datasets
+load("lplong.R")
+load("output_features_medium.R")
+load("output_variablenames_medium.R")
+load("output_features_raw_medium.R")
+load("loadings.model1.R")
+```
+
+```{r Compiling Data, include=FALSE}
+### Calculating new variables
+
+# BPRS positive symptoms (hostile suspicious + thought disturbance)
+lplong$bprs_postot <- lplong$bprs_factor_hostsus + lplong$bprs_factor_thought
+
+# Center timepoint at time1
+lplong$timepoint <- lplong$timepoint - 1
+
+# Time squared
+lplong$timesquared <- lplong$timepoint^2
+
+# Gender
+lplong$demo_gender2 <- lplong$demo_gender %>% as.character()
+lplong$demo_gender2[which(lplong$demo_gender2 == "Unknown")] <- NA
+lplong$demo_gender2[which(lplong$demo_gender2 == "Non-Binary")] <- NA
+lplong$demo_gender2 <- as.factor(lplong$demo_gender2)
+
+# Race
+table(lplong$demo_race)
+lplong$demo_race2 <- rep(NA, nrow(lplong))
+lplong$demo_race2[which(lplong$demo_race %in% c("Other", "Multiple"))] <- "Other"
+lplong$demo_race2[which(lplong$demo_race == "White")] <- "White"
+lplong$demo_race2[which(lplong$demo_race == "Black")] <- "AABlack"
+lplong$demo_race2[which(lplong$demo_race == "Asian")] <- "Asian"
+table(lplong$demo_race2)
+
+lplong$demo_white <- rep(0, nrow(lplong))
+lplong$demo_white[which(lplong$demo_race == "White")] <- 1
+lplong$demo_white[which(is.na(lplong$demo_race))] <- NA
+lplong$demo_white <- as.factor(lplong$demo_white)
+table(lplong$demo_white)
+
+# Age Categorical
+hist(lplong$demo_age)
+quantile(lplong$demo_age, probs = c(0.3333333, 0.6666666, 1))
+lplong$demo_age2 <- rep(0, nrow(lplong))
+lplong$demo_age2[which(lplong$demo_age >= 24.1 & lplong$demo_age < 29.1)] <- 1
+lplong$demo_age2[which(lplong$demo_age > 29.1)] <- 2
+table(lplong$demo_age2)
+
+lplong$demo_age2 <- as.factor(lplong$demo_age2)
+
+# Diagnosis condensed
+lplong$dxcurr_psyscale2 <- as.character(lplong$dxcurr_psyscale) %>% as.factor()
+table(lplong$dxcurr_psyscale2)
+
+### Merging data
+# Long dataset with features + components from medium feature set
+lp.medium <- lplong
+lp.medium <- merge(lp.medium, out_features.medium, by.x = "wll_sessionid", by.y = "session_id")
+lp.medium <- merge(lp.medium, out_fraw.medium, by.x = "wll_sessionid", by.y = "session_id")
+
+```
+
+```{r fx for lme, include=FALSE}
+fx_lme <- function(vars_tolme, vars_outcome, effect_type=c("main", "linear", "quadratic")) {
+      
+      #Empty dataframe
+      lmmsig <- matrix(ncol = 5, nrow = 0) %>% as.data.frame()
+      n = length(vars_tolme)
+      
+      # For loop
+      for (i in 1:n) {
+      
+      # Define feature to interate on
+      feature = vars_tolme[[i]]
+      
+      # Model + model parameters for main effect
+      if (effect_type == "main") {
+            f = paste(vars_outcome, " ~ timepoint + ", feature)
+            model <- lme(as.formula(f),
+                   data = lp.medium, random = ~ 1 | grid, na.action = "na.omit")
+            model_index = 3
+      }
+      
+      # Model + model parameters for linear effect
+      else if (effect_type == "linear") {
+            f = paste(vars_outcome, " ~ timepoint + ", feature, " + ", "timepoint*", feature)
+            model <- lme(as.formula(f),
+                   data = lp.medium, random = ~ 1 | grid, na.action = "na.omit")
+            model_index = 4
+      }
+      
+      # Model + model parameters for quadratic effect
+      else if (effect_type == "quadratic") {
+            f = paste(vars_outcome, " ~ timepoint + timesquared + ", feature,
+                      " + timepoint*", feature, " + timesquared*", feature)
+            model <- lme(as.formula(f),
+                   data = lp.medium, random = ~ 1 | grid, na.action = "na.omit")
+            model_index = 6
+      }      
+      
+      # Extract coefficient + p value for this variable
+      p <- anova(model)$p[model_index]
+      b <- model$coefficients$fixed[model_index]
+      
+      # If significant...
+      if (p<0.05) {
+            #Add a new row
+            lmmsig <- rbind(lmmsig, c(NA, NA, NA, NA, NA))
+            
+            #Input variable name and p value
+            lmmsig[nrow(lmmsig), 1] <- feature
+            lmmsig[nrow(lmmsig), 2] <- b
+            lmmsig[nrow(lmmsig), 3] <- p
+            lmmsig[nrow(lmmsig), 5] <- f
+      }
+      
+      else {next}
+}
+
+# Correct for multiple comparisons
+colnames(lmmsig) <- c("feature", "beta", "p", "p.adj", "formula")
+lmmsig$p.adj <- p.adjust(lmmsig$p, method = "fdr", n = n)
+
+# Order by effect size
+lmmsig <- arrange(lmmsig, p)
+
+# Return output
+lmmsig <<- lmmsig
+print(lmmsig)
+}
+```
+
+```{r fx for just model, include=FALSE}
+fx_lme_model <- function(feature, outcome, effect_type=c("main", "linear", "quadratic")) {
+
+      # Model + model parameters for main effect
+      if (effect_type == "main") {
+            f = paste(outcome, " ~ timepoint + ", feature)
+            model <- lme(as.formula(f),
+                   data = lp.medium, random = ~ 1 | grid, na.action = "na.omit")
+      }
+      
+      # Model + model parameters for linear effect
+      else if (effect_type == "linear") {
+            f = paste(outcome, " ~ timepoint + ", feature, " + ", "timepoint*", feature)
+            model <- lme(as.formula(f),
+                   data = lp.medium, random = ~ 1 | grid, na.action = "na.omit")
+      }
+      
+      # Model + model parameters for quadratic effect
+      else if (effect_type == "quadratic") {
+            f = paste(outcome, " ~ timepoint + timesquared + ", feature,
+                      " + timepoint*", feature, " + timesquared*", feature)
+            model <- lme(as.formula(f),
+                   data = lp.medium, random = ~ 1 | grid, na.action = "na.omit")
+      }      
+      
+      return(model)
+
+}
+```
+
+```{r Fx Store Model Features, include = FALSE}
+## Function - store linear interaction models
+fx_storemodel <- function(df, model_name=model, model_label="analysis_label", type=c("main", "linear", "quadratic")) {
+      
+      out_lmmresults <- df
+      
+      # Skip quadratic - do those manually
+      if (type == "quadratic") {
+            print("CAUTION - quadratic model detected")
+      }
+      
+      else {
+            # Add blank row
+            n = nrow(out_lmmresults) + 1
+            out_lmmresults[n,] = rep(NA, ncol(out_lmmresults))
+            
+            # Fill in model characteristics
+            rownames(out_lmmresults)[n] <- as.character(model_label)
+            out_lmmresults[n, "AIC"] <- model_name$AIC
+            out_lmmresults[n, "BIC"] <- model_name$BIC
+            
+            if(type == "main") {
+                  # Store coefficients, t values, p values
+                  out_lmmresults[n, 3:5] <- model_name$coefficients$fixed
+                  out_lmmresults[n, 7:9] <- model$tTable[,"t-value"]
+                  out_lmmresults[n, 11:13] <- model$tTable[,"p-value"]
+            }
+            
+            if(type == "linear") {
+                  # Store coefficients, t values, p values
+                  out_lmmresults[n, 3:6] <- model_name$coefficients$fixed
+                  out_lmmresults[n, 7:10] <- model$tTable[,"t-value"]
+                  out_lmmresults[n, 11:14] <- model$tTable[,"p-value"]
+            }
+            
+      }
+      
+      return(out_lmmresults)
+}
+
+```
+
+```{r Fx predictions for plots, include=FALSE}
+fx_out_linpred <- function(df, model) {
+      
+      # Isolating the correct coefficients
+      c1 = df[model,"c_intercept"]
+      c2 = df[model,"c_timepoint"]
+      c3 = df[model,"c_feature"]
+      c4 = df[model,"c_txf"]
+      
+      # 2-layer function where f=feature and t=timepoint - copy this
+      fx_linearlmm <- function(f) {
+            function(t) {c1 + c2*t + c3*f + c4*t*f}
+      }
+
+      
+      # f values which we are plotting - copy this
+      f_args = c(-2, -1, 0, 1, 2)
+      
+      # Constructing the dataset to draw the predicted lines from
+      in_1 <- data.frame(t = 0:3)
+      in_2 <- mutate(in_1, 
+                     across(t, map(f_args, ~ fx_linearlmm(f=.)))
+      )
+      in_3 <- pivot_longer(in_2, cols = -t)
+      
+      return(in_3)
+}
+```
+
+# Notes/Summary:
+## Data 
+### Inputs: 
+- <span style="color: red;">lplong</span> -- compiled longformat clinical data 
+- winterlight features and aggregate features
+- <span style="color: red;">lp.medium </span> -- clinical data from lpop compiled together with component scores + individual features. Medium length set.
+
+### Pre-processing:
+- 357 features in medium set
+- features were collapsed from raw per stimulus values by task category: acoustic 45, lexical 27, discourse 216, fluency 2, picture description 27
+- resulted in 162 observations of 760 variables by task
+- removed: variables with SD of 0 or NA, >90% kurtosis = 19.9, 2 observations with high numbers of missing values, then ranked by total correlations with all other features and successively removed those with highest correlations to other variables which had high correlations with other variables (>0.85 absolute value). 
+- resulted in 160 observations of 357 nlp features
+- task types: paragraph = 7, fluency = 37, picture description = 160, journaling = 153
+- feature categories (wll version): acoustic 13, discourse 18, global coherence 2, information content 6, lexical 79, local coherence 5, morphological 0, picture aggregate 0, sentiment 21, syntactic 177, timing 31, task 2
+- feature categories (sunny version): 44 acoustic and timing, 58 lexical and sentiment, 215 discourse organization, 2 fluency task scores, 8 picture description specific
+- ran PCA for single component based on unimputed raw data (pairwise deletion of NA values)
+- needed to impute in order to calculate component scores - 12 variables missing up to 6 observations each. used random forest imputation from missForest
+- used PCA to generate component scores for 1 component - promax rotation.
+
+## Analysis
+Main objective is to determine whether NLP features can act as objective markers of psychosis symptoms
+- Positive symptoms
+- Negative symptoms
+- FTD
+
+## New to this version
+- analyzed group characteristics based on followups.
+
+
+# Methods
+## M1. Participants
+- No demographic differences based on timepoint
+```{r Participants, results='asis'}
+tableby(timepoint ~ demo_age + demo_gender2 + demo_sex + demo_race + demo_ethnicity + demo_education + dxcurr_psyscale + bprs_postot + sans_tot_global + tlc_sum, data = lp.medium) %>% summary()
+
+fisher.test(lp.medium$timepoint, lp.medium$demo_gender2)
+fisher.test(lp.medium$timepoint, lp.medium$demo_sex)
+fisher.test(lp.medium$timepoint, lp.medium$demo_race2, simulate.p.value = TRUE)
+fisher.test(lp.medium$timepoint, lp.medium$dxcurr_psyscale2, simulate.p.value = TRUE)
+```
+
+## M2. Clinical - Followup times
+```{r}
+summary(lp.medium$interval_weeks_12)
+summary(lp.medium$interval_weeks_23)
+summary(lp.medium$interval_weeks_24)
+
+summary(lp.medium$interval_days_12)
+```
+
+## M5. Top Loaders:
+```{r}
+temp <- abs(loadings.model1) %>% sort(decreasing = TRUE)
+vars_toploaders <- names(temp)[1:50]
+loadings.model1[vars_toploaders] %>% sort(decreasing = TRUE)
+```
+
+## Supp: baseline clinical characteristics based on dropout
+```{r}
+# Make a new variable that encodes how many followups they got
+lp.medium$timepoint_count <- rep(NA, nrow(lp.medium))
+
+for (i in lp.medium$grid) {
+      temp <- filter(lp.medium, grid == i) %>% select(wll_sessionid:timepoint)
+      lp.medium$timepoint_count[which(lp.medium$grid == i)] <- nrow(temp)
+}
+
+### Look just at timepoint 1
+justbaseline <- filter(lp.medium, timepoint==0)
+table(justbaseline$timepoint_count)
+
+```
+```{r, results='asis'}
+### Examine sample characteristics across survivalness
+tableby(timepoint_count ~ demo_age + demo_gender2 + demo_sex + demo_race + demo_ethnicity + demo_education + dxcurr_psyscale + bprs_postot + sans_tot_global + tlc_sum, data = justbaseline) %>% summary()
+```
+
+
+# R1. Single component vs. Psychosis Symptoms
+
+## R1-A) Single Component vs. TD Symptoms
+- Significant for main effect (trend) + linear interaction, not quadratic.
+- linear is best fit: AIC 1212, BIC = 1230
+```{r}
+### Main Effect
+lme(tlc_sum ~ C.single.medium + timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+### Linear Interaction
+lme(tlc_sum ~ C.single.medium*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+### Quadratic Interaction
+lme(tlc_sum ~ C.single.medium*timepoint + C.single.medium*timesquared, data = lp.medium, random = ~1 | grid) %>% summary()
+```
+
+
+```{r store td, include=FALSE}
+## Empty df
+out_lmm_main <- matrix(nrow = 0, ncol = 14) %>% as.data.frame()
+colnames(out_lmm_main) <- c("AIC", "BIC",
+                              "c_intercept", "c_timepoint", "c_feature", "c_txf",
+                              "t_intercept", "t_timepoint", "t_feature", "t_txf",
+                              "p_intercept", "p_timepoint", "p_feature", "p_txf")
+
+### Store Final Values
+model <- lme(tlc_sum ~ timepoint + C.single.medium + C.single.medium*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+out_lmm_main <- fx_storemodel(out_lmm_main, model, "Csingle_td", "linear")
+```
+
+```{r, echo=FALSE}
+### F1-A - TD
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_main, model = "Csingle_td")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=tlc_sum, group=grid),
+                 alpha = 0.6, color = "turquoise") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=tlc_sum, group=grid),
+                alpha = 0.6, color="turquoise4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="Thought Disorder Symptoms", title = "C) Component Score & Thought Disorder") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+```
+
+## R1-B) Single Component vs. Negative Symptoms
+- NOT significant for main effect (trend) or quadratic interaction, but was VERY significant for linear interaction
+- BIC main = 871.9, BIC linear = 861.8/AIC=843.5, BIC quadratic = 874.0: so linear is best
+```{r}
+### Main Effect
+lme(sans_tot_global ~ C.single.medium + timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+### Linear Interaction
+lme(sans_tot_global ~ C.single.medium*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+### Quadratic Interaction
+lme(sans_tot_global ~ C.single.medium*timepoint + C.single.medium*timesquared, data = lp.medium, random = ~1 | grid) %>% summary()
+```
+```{r store neg, include=FALSE}
+### Store Final Values
+model <- lme(sans_tot_global ~ timepoint + C.single.medium + C.single.medium*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+out_lmm_main <- fx_storemodel(out_lmm_main, model, "Csingle_neg", "linear")
+```
+
+```{r, echo=FALSE}
+### F1-B) Negative Symptoms ###
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_main, model = "Csingle_neg")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms", title = "B) Component Score & Negative Symptoms") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+```
+
+
+## R1-C) Single Component vs. Positive Symptoms
+- NOT significant for main effect or quadratic interaction, but was significant for linear interaction
+- Linear model best based on AIC + loglikelihood (but not BIC - similar). AIC = 997, BIC=1015
+- BIC - smaller is better model. diff < 2, weak evidence; 2-6 positive evidence; 6-10 strong evidence.
+- Log Likelihood - more positive (less negative) is better
+```{r}
+### Main Effect
+lme(bprs_postot ~ C.single.medium + timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+### Linear Interaction
+lme(bprs_postot ~ C.single.medium*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+### Quadratic Interaction
+lme(bprs_postot ~ C.single.medium*timepoint + C.single.medium*timesquared, data = lp.medium, random = ~1 | grid) %>% summary()
+```
+
+```{r store pos, include=FALSE}
+### Store Final Values
+## Model
+model <- lme(bprs_postot ~ timepoint + C.single.medium + C.single.medium*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+out_lmm_main <- fx_storemodel(out_lmm_main, model, "Csingle_pos", "linear")
+```
+
+```{r, echo=FALSE}
+### 1C) Positive Symptoms ###
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_main, model = "Csingle_pos")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=bprs_postot, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=bprs_postot, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Positive Symptoms", title="A) Component Score & Positive Symptoms") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+```
+
+
+## Summary of main models
+```{r}
+print(out_lmm_main)
+```
+
+
+# R2) TD vs. individual symptoms
+
+## Checking individual features
+
+### Td - main effect
+```{r}
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "tlc_sum", effect_type = "main")
+
+# Save output
+out_td_main <- lmmsig
+out_td_main$type <- rep("main", nrow(out_td_main))
+```
+
+### Td - linear effect
+```{r}
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "tlc_sum", effect_type = "linear")
+
+# Save output
+out_td_linear <- lmmsig
+out_td_linear$type <- rep("linear", nrow(out_td_linear))
+```
+
+### Save top models-TD
+- Top n based on lowest ADJUSTED p values, across all model types
+```{r, echo=FALSE}
+### Selecting models with p adj < 0.05
+out_td_all <- rbind(out_td_main, out_td_linear) %>% arrange(p.adj)
+out_td_all[which(out_td_all$p.adj<0.05),]
+n = nrow(out_td_all[which(out_td_all$p.adj<0.05),])
+
+### info_units_count_PIC is both main and linear
+# See which is better model - linear is better
+lme(tlc_sum ~ info_units_count_PIC + timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+lme(tlc_sum ~ info_units_count_PIC*timepoint, data = lp.medium, random = ~1 | grid) %>% summary()
+
+out_td_all <- out_td_all[-which(out_td_all$feature=="info_units_count_PIC" & out_td_all$type=="main"),]
+
+### Save model features
+# Model labels
+temp <- paste(out_td_all[1:n,"feature"], "_td", sep="")
+
+# Empty dataframe
+out_lmm_td <- matrix(nrow = 0, ncol = 14) %>% as.data.frame()
+colnames(out_lmm_td) <- c("AIC", "BIC",
+                              "c_intercept", "c_timepoint", "c_feature", "c_txf",
+                              "t_intercept", "t_timepoint", "t_feature", "t_txf",
+                              "p_intercept", "p_timepoint", "p_feature", "p_txf")
+
+# Store values
+for (i in 1:n) {
+      model <- fx_lme_model(feature = out_td_all[i, "feature"], 
+                            outcome = "tlc_sum", 
+                            effect_type = out_td_all[i, "type"])
+      
+      model <- summary(model)
+      
+      out_lmm_td <- fx_storemodel(
+            df = out_lmm_td,
+            model_name = model, 
+            model_label = temp[i], 
+            type = out_td_all[i, "type"])
+}
+
+# Print
+print(out_lmm_td)
+```
+
+
+## Individual features
+- Choose: (1) category_subordinate_JOU, (2)info_units_count_PIC. All main effects.
+- category_subordinate_JOU: No sig interaction with any demo. DEFINITION= Raw number of subordinating conjunctions; a subordinate conjunction (underlined) introduces a subordinate (also called dependent) clause (italicized), which is a phrase with a subject and a predicate (usually verb) that cannot stand alone.
+- info_units_count_PIC: no significant interactions. DEFINITION=Picture description: raw number of info units mentioned in transcript
+- [OMIT] local_coherence_Google_300_min_dist_JOU: Significant interaction in black vs. white race but still sig with race covariance. no interactions with gender or age. DEFINITION=Minimum cosine distance between successive utterances (over all utterances), using the Google 300-dim word vectors. Unintelligible words are excluded.
+
+### 5B) TD features vs. demographics
+```{r}
+### category_subordinate_JOU (main)
+fx_lme_model(feature = "category_subordinate_JOU", outcome = "tlc_sum", effect_type = "main") %>% summary
+
+## Gender
+lme(tlc_sum ~ demo_gender2*category_subordinate_JOU + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+## Race
+lme(tlc_sum ~ demo_race2*category_subordinate_JOU + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+
+### info_units_count_action_PIC (linear)
+fx_lme_model(feature = "info_units_count_action_PIC", outcome = "tlc_sum", effect_type = "linear") %>% summary
+
+## Gender
+lme(tlc_sum ~ demo_gender2*info_units_count_action_PIC*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+## Race
+lme(tlc_sum ~ demo_race2*info_units_count_action_PIC*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+```
+### Graph 2A/B
+```{r, echo=FALSE}
+###### Fig 2 - Individual features vs. TD #######
+
+### 2A) Subordinating conjunctions vs. TD
+# Get predicted values
+out_lmm_td$c_txf[which(is.na(out_lmm_td$c_txf))] <- 0
+predicted <- fx_out_linpred(df = out_lmm_td, model = "category_subordinate_JOU_td")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=tlc_sum, group=grid),
+                 alpha = 0.6, color = "turquoise") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=tlc_sum, group=grid),
+                alpha = 0.6, color="turquoise4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="Thought Disorder Symptoms", title = "A) Subordinating conjunctions vs. TD") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### 2B) info_units_count_PIC vs. TD
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_td, model = "info_units_count_PIC_td")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=tlc_sum, group=grid),
+                 alpha = 0.6, color = "turquoise") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=tlc_sum, group=grid),
+                alpha = 0.6, color="turquoise4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="Thought Disorder Symptoms", title = "B) Picture units identified vs. TD") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+```
+
+### Word count
+- info units are negatively associated with TD. 
+
+
+
+
+# R3. Negative Symptoms
+
+## Identifying individual features
+
+### Neg ss - Main Effect
+```{r}
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "sans_tot_global", effect_type = "main")
+
+# Save output
+out_neg_main <- lmmsig
+out_neg_main$type <- rep("main", nrow(out_neg_main))
+```
+
+### Neg ss - Linear Effect
+```{r}
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "sans_tot_global", effect_type = "linear")
+
+# Save output
+out_neg_linear <- lmmsig
+out_neg_linear$type <- rep("linear", nrow(out_neg_linear))
+```
+
+### Save top models-Neg
+- Top n based on lowest ADJUSTED p values, across all model types
+```{r, echo=FALSE}
+### Selecting top 10 models
+out_neg_all <- rbind(out_neg_main, out_neg_linear) %>% arrange(p.adj)
+out_neg_all[which(out_neg_all$p.adj<0.05),]
+n = nrow(out_neg_all[which(out_neg_all$p.adj<0.05),])
+
+### Save model features
+
+# Model labels
+temp <- paste(out_neg_all[1:n,"feature"], "_neg", sep="")
+
+# Empty dataframe
+out_lmm_neg <- matrix(nrow = 0, ncol = 14) %>% as.data.frame()
+colnames(out_lmm_neg) <- c("AIC", "BIC",
+                              "c_intercept", "c_timepoint", "c_feature", "c_txf",
+                              "t_intercept", "t_timepoint", "t_feature", "t_txf",
+                              "p_intercept", "p_timepoint", "p_feature", "p_txf")
+
+# Store values
+for (i in 1:n) {
+      model <- fx_lme_model(feature = out_neg_all[i, "feature"], 
+                            outcome = "sans_tot_global", 
+                            effect_type = out_neg_all[i, "type"])
+      
+      model <- summary(model)
+      
+      out_lmm_neg <- fx_storemodel(
+            df = out_lmm_neg,
+            model_name = model, 
+            model_label = temp[i], 
+            type = out_neg_all[i, "type"])
+}
+
+# Print
+print(out_lmm_neg)
+```
+
+## Individual features
+- Choose: constituency_average_ADJP_length_PIC_neg, local_coherence_Google_300_avg_dist_PIC_neg
+- No demo interactions for constituency_average_ADJP_length_PIC_neg or local_coherence_Google_300_avg_dist_PIC_neg
+- constituency_average_ADJP_length_PIC DEFINITION: average number of words in adjectival phrases
+- local_coherence_Google_300_avg_dist_PIC DEFINITION: Average cosine distance between successive utterances (averaged over all utterances), using the GloVe 300-dim word vectors. Unintelligible words are excluded.
+
+### 5C) Interactions with demographics
+```{r}
+### constituency_average_ADJP_length_PIC
+fx_lme_model(feature = "constituency_average_ADJP_length_PIC", outcome = "sans_tot_global", effect_type = "linear") %>% summary()
+
+## Gender
+lme(sans_tot_global ~ demo_gender2*constituency_average_ADJP_length_PIC*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+## Race
+lme(sans_tot_global ~ demo_race2*constituency_average_ADJP_length_PIC*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+
+
+### Noun local_coherence_Google_300_avg_dist_PIC
+fx_lme_model(feature = "local_coherence_Google_300_avg_dist_PIC", outcome = "sans_tot_global", effect_type = "linear") %>% summary()
+
+## Gender
+lme(sans_tot_global ~ demo_gender2*local_coherence_Google_300_avg_dist_PIC*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+## Race
+lme(sans_tot_global ~ demo_race2*local_coherence_Google_300_avg_dist_PIC*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+```
+
+### Graphs 2C/D
+```{r, echo=FALSE}
+### 2C) constituency_average_ADJP_length_PIC
+
+# Get predicted values
+out_lmm_neg$c_txf[which(is.na(out_lmm_neg$c_txf))] <- 0
+predicted <- fx_out_linpred(df = out_lmm_neg, model = "constituency_average_ADJP_length_PIC_neg")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms", title = "C) Adj. phrase length vs. Negative Symptoms") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### 2D) local_coherence_Google_300_avg_dist_PIC
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_neg, model = "local_coherence_Google_300_avg_dist_PIC_neg")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms", title = "D) Semantic distance vs. Negative Symptoms") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+```
+
+
+# R4) Positive Symptoms
+- Procedure: Run through main, + linear effects and choose some n features with highest effect sizes / most clinically significant effect sizes to illustrate relationships.
+
+## Identifying individual features
+
+### Main Effects:
+```{r}
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_postot", effect_type = "main")
+
+# Save output
+out_pos_main <- lmmsig
+out_pos_main$type <- rep("main", nrow(out_pos_main))
+```
+
+### Linear Effects:
+```{r}
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_postot", effect_type = "linear")
+
+# Save output
+out_pos_linear <- lmmsig
+out_pos_linear$type <- rep("linear", nrow(out_pos_linear))
+```
+
+
+## Try Individual positive symptoms
+
+### Which pos symptoms?
+- Hostile suspiciousness = Hostility, Suspiciousness, Uncooperativeness; Thought disturbance = Hallucinatory behavior, Conceptual disorganization, Unusual thought content
+- checked distributions and these had good distribution: Suspiciousness, Hallucinatory behavior, Conceptual disorganization, Unusual thought content
+```{r, include=FALSE}
+hist(lp.medium$bprs_hostility)
+hist(lp.medium$bprs_suspicious)
+hist(lp.medium$bprs_uncoop)
+hist(lp.medium$bprs_hallucination)
+hist(lp.medium$bprs_conceptual)
+hist(lp.medium$bprs_unusual)
+```
+
+
+### Main effects?
+- Of these, you get sig effects even after adjusting for mult. comparisons for suspiciousness, trend for hallucinations. Very bad for unusual thought content + others.
+```{r}
+### Suspiciousness
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_suspicious", effect_type = "main")
+
+# Save output
+out_sus_all <- lmmsig
+out_sus_all$type <- rep("main", nrow(out_sus_all))
+
+### Hallucinations
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_hallucination", effect_type = "main")
+
+# Save output
+out_hal_all <- lmmsig
+out_hal_all$type <- rep("main", nrow(out_hal_all))
+
+### Unusual thought content (Delusions)
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_unusual", effect_type = "main")
+
+### Conceptual Disorganization
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_conceptual", effect_type = "main")
+
+```
+
+### Linear Effects
+- Just individual Positive symptoms - linear effects? Just one trend level for delusions and it's the only one. So appeared to be spurious.
+```{r, include=FALSE}
+### Suspiciousness
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_suspicious", effect_type = "linear")
+
+### Hallucinations
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_hallucination", effect_type = "linear")
+
+### Unusual thought content (Delusions)
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_unusual", effect_type = "linear")
+
+### Conceptual Disorganization
+# Run through all features
+fx_lme(vars_tolme = vars_toploaders, vars_outcome = "bprs_conceptual", effect_type = "linear")
+
+```
+
+### Save top models
+- sig features for each symptom
+
+```{r, echo=FALSE}
+### Suspiciousness
+
+## sig models
+out_sus_all[which(out_sus_all$p.adj<0.05),]
+n = nrow(out_sus_all[which(out_sus_all$p.adj<0.05),])
+
+## Save model features
+
+# Model labels
+temp <- paste(out_sus_all[1:n,"feature"], "_pos", sep="")
+
+# Empty dataframe
+out_lmm_sus <- matrix(nrow = 0, ncol = 14) %>% as.data.frame()
+colnames(out_lmm_sus) <- c("AIC", "BIC",
+                              "c_intercept", "c_timepoint", "c_feature", "c_txf",
+                              "t_intercept", "t_timepoint", "t_feature", "t_txf",
+                              "p_intercept", "p_timepoint", "p_feature", "p_txf")
+# Store values
+for (i in 1:n) {
+      model <- fx_lme_model(feature = out_sus_all[i, "feature"], 
+                            outcome = "bprs_suspicious", 
+                            effect_type = out_sus_all[i, "type"])
+      
+      model <- summary(model)
+      
+      out_lmm_sus <- fx_storemodel(
+            df = out_lmm_sus,
+            model_name = model, 
+            model_label = temp[i], 
+            type = out_hal_all[i, "type"])
+}
+
+# Print
+print(out_lmm_sus)
+```
+
+```{r, echo=FALSE}
+### Hallucination
+
+## sig models
+out_hal_all[which(out_hal_all$p.adj<0.06),]
+n = nrow(out_hal_all[which(out_hal_all$p.adj<0.06),])
+
+## Save model features
+
+# Model labels
+temp <- paste(out_hal_all[1:n,"feature"], "_pos", sep="")
+
+# Empty dataframe
+out_lmm_hal <- matrix(nrow = 0, ncol = 14) %>% as.data.frame()
+colnames(out_lmm_hal) <- c("AIC", "BIC",
+                              "c_intercept", "c_timepoint", "c_feature", "c_txf",
+                              "t_intercept", "t_timepoint", "t_feature", "t_txf",
+                              "p_intercept", "p_timepoint", "p_feature", "p_txf")
+# Store values
+for (i in 1:n) {
+      model <- fx_lme_model(feature = out_hal_all[i, "feature"], 
+                            outcome = "bprs_hallucination", 
+                            effect_type = out_hal_all[i, "type"])
+      
+      model <- summary(model)
+      
+      out_lmm_hal <- fx_storemodel(
+            df = out_lmm_hal,
+            model_name = model, 
+            model_label = temp[i], 
+            type = out_hal_all[i, "type"])
+}
+
+# Print
+print(out_lmm_hal)
+```
+
+```{r}
+lme(bprs_conceptual ~ info_units_count_action_PIC + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+```
+
+## Individual features
+- Suspiciousness: category_subordinate_JOU - No interaction with demo, DEFINITION = Raw number of subordinating conjunctions;
+- Hallucinations: NOUN_age_of_acquisition_JOU - No interaction with demo
+
+### Demographic Interactions
+
+```{r}
+### category_subordinate_JOU vs. suspiciousness
+fx_lme_model(feature = "category_subordinate_JOU", outcome = "bprs_suspicious", effect_type = "main") %>% summary
+
+## Gender
+lme(bprs_suspicious ~ demo_gender2*category_subordinate_JOU + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+## Race
+lme(bprs_suspicious ~ demo_race2*category_subordinate_JOU + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+```
+
+```{r}
+### NOUN_age_of_acquisition_JOU vs. hallucinations
+fx_lme_model(feature = "NOUN_age_of_acquisition_JOU", outcome = "bprs_hallucination", effect_type = "main") %>% summary
+
+## Gender
+lme(bprs_hallucination ~ demo_gender2*NOUN_age_of_acquisition_JOU + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+## Race
+lme(bprs_hallucination ~ demo_race2*NOUN_age_of_acquisition_JOU + timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+```
+
+### Graphs
+```{r, echo=FALSE}
+### 2E) category_subordinate_JOU vs. suspiciousness
+# Get predicted values
+out_lmm_sus$c_txf[which(is.na(out_lmm_sus$c_txf))] <- 0
+predicted <- fx_out_linpred(df = out_lmm_sus, model = "category_subordinate_JOU_pos")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=bprs_suspicious, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=bprs_suspicious, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Suspiciousness", title="E) Subordinating conjunctions vs. Suspiciousness") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### 2F) NOUN_age_of_acquisition_JOU vs. hallucinations
+# Get predicted values
+out_lmm_hal$c_txf[which(is.na(out_lmm_hal$c_txf))] <- 0
+predicted <- fx_out_linpred(df = out_lmm_hal, model = "NOUN_age_of_acquisition_JOU_pos")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=bprs_hallucination, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=bprs_hallucination, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Hallucinations", title="F) Age of acquisition vs. Hallucinations") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+```
+
+
+
+# R5. How do top features predict other symptoms?
+
+## How do symptoms themselves relate to one another?
+- All positive and significant - worse psychosis is worse psychosis
+```{r}
+just_symptoms <- lp.medium %>% select(tlc_sum, sans_tot_global, bprs_suspicious, bprs_hallucination)
+
+cor(just_symptoms, method = "spearman")
+```
+
+## features vs. symptoms
+
+### Using top TD feautres
+- good deal of overlap!
+```{r}
+vars_top_td <- out_td_all$feature[1:15]
+
+### Check negative
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "sans_tot_global", effect_type = "main")
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "sans_tot_global", effect_type = "linear")
+
+### Check suspiciousness
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_suspicious", effect_type = "main")
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_suspicious", effect_type = "linear")
+
+### Check Hallucinations
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_hallucination", effect_type = "main")
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_hallucination", effect_type = "linear")
+```
+
+### Using top Neg SS feautres
+```{r}
+vars_top_neg <- out_neg_all$feature[1:14]
+
+### Check TD
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "tlc_sum", effect_type = "main")
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "tlc_sum", effect_type = "linear")
+
+### Check suspiciousness
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_suspicious", effect_type = "main")
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_suspicious", effect_type = "linear")
+
+### Check Hallucinations
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_hallucination", effect_type = "main")
+fx_lme(vars_tolme = vars_top_td, vars_outcome = "bprs_hallucination", effect_type = "linear")
+```
+
+### Using top Suspiciousness feautres
+```{r}
+vars_top_sus <- out_sus_all$feature[1:5]
+
+### Check TD
+fx_lme(vars_tolme = vars_top_sus, vars_outcome = "tlc_sum", effect_type = "main")
+fx_lme(vars_tolme = vars_top_sus, vars_outcome = "tlc_sum", effect_type = "linear")
+
+### Check Neg s/s
+fx_lme(vars_tolme = vars_top_sus, vars_outcome = "sans_tot_global", effect_type = "main")
+fx_lme(vars_tolme = vars_top_sus, vars_outcome = "sans_tot_global", effect_type = "linear")
+
+### Check Hallucinations
+fx_lme(vars_tolme = vars_top_sus, vars_outcome = "bprs_hallucination", effect_type = "main")
+fx_lme(vars_tolme = vars_top_sus, vars_outcome = "bprs_hallucination", effect_type = "linear")
+```
+
+
+## Graphs
+
+### Gathering model features
+```{r}
+## Arguments
+justoverlapargs <- as.data.frame(c(
+      rep("SBAR_.._IN_S_JOU", 3),
+      rep("local_coherence_Google_300_min_dist_JOU", 3),
+      rep("imageability_JOU", 3)
+))
+colnames(justoverlapargs) <- "feature"
+
+justoverlapargs$outcome <- rep(c("tlc_sum", "sans_tot_global", "bprs_suspicious"), 3)
+
+justoverlapargs$effect_type <- c("main", "linear", "main",
+                            "main", "linear", "main",
+                            "main", "linear", "main")
+
+justoverlapargs$model_label <- paste(justoverlapargs$feature,
+                                     rep(c("td", "neg", "sus"), 3), sep="_")
+
+justoverlapargs
+
+
+## Save model features
+
+# Empty dataframe
+out_lmm_overlap <- matrix(nrow = 0, ncol = 14) %>% as.data.frame()
+colnames(out_lmm_overlap) <- c("AIC", "BIC",
+                              "c_intercept", "c_timepoint", "c_feature", "c_txf",
+                              "t_intercept", "t_timepoint", "t_feature", "t_txf",
+                              "p_intercept", "p_timepoint", "p_feature", "p_txf")
+# Store values
+for (i in 1:9) {
+      model <- fx_lme_model(feature = justoverlapargs[i, "feature"], 
+                            outcome = justoverlapargs[i, "outcome"], 
+                            effect_type = justoverlapargs[i, "effect_type"])
+      
+      model <- summary(model)
+      
+      out_lmm_overlap <- fx_storemodel(
+            df = out_lmm_overlap,
+            model_name = model, 
+            model_label = justoverlapargs[i, "model_label"], 
+            type = justoverlapargs[i, "effect_type"])
+}
+
+# Print
+print(out_lmm_overlap)
+```
+
+### Semantic distance
+
+```{r}
+### local_coherence_Google_300_min_dist_JOU + TD
+# Get predicted values
+out_lmm_overlap$c_txf[which(is.na(out_lmm_overlap$c_txf))] <- 0
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "local_coherence_Google_300_min_dist_JOU_td")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=tlc_sum, group=grid),
+                 alpha = 0.6, color = "turquoise") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=tlc_sum, group=grid),
+                alpha = 0.6, color="turquoise4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="Thought Disorder Symptoms", title = "A) Semantic distance vs. TD") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### local_coherence_Google_300_min_dist_JOU + NEG
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "local_coherence_Google_300_min_dist_JOU_neg")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms", title = "A) Semantic distance vs. Neg S/S") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### local_coherence_Google_300_min_dist_JOU vs. suspiciousness
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "local_coherence_Google_300_min_dist_JOU_sus")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=bprs_suspicious, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=bprs_suspicious, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Suspiciousness", title="C) Semantic distance vs. Suspiciousness") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+```
+### imageability
+```{r}
+### imageability_JOU + TD
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "imageability_JOU_td")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=tlc_sum, group=grid),
+                 alpha = 0.6, color = "turquoise") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=tlc_sum, group=grid),
+                alpha = 0.6, color="turquoise4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="Thought Disorder Symptoms", title = "D) Imageability vs. TD") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### imageability_JOU + NEG
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "imageability_JOU_neg")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms", title = "E) Imageability vs. Neg S/S") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+### imageability_JOU vs. suspiciousness
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "imageability_JOU_sus")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=bprs_suspicious, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=bprs_suspicious, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Suspiciousness", title="F) Imageability vs. Suspiciousness") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+```
+
+
+
+OMIT THIS--
+```{r}
+### category_subordinate_JOU + NEG
+
+# Get predicted values
+predicted <- fx_out_linpred(df = out_lmm_overlap, model = "category_subordinate_JOU_neg")
+
+# Plot
+ggplot() +
+      geom_point(data = lp.medium, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = lp.medium,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms", title = "A) Subordinating conjunctions vs. Neg S/S") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+```
+
+
+
+# 6. Demographic effects on single component
+
+## 6c) Positive symptoms
+- White race had a significant interaction on the interaction between the speech features and timepoint. After covarying for race, the effect of speech on positive symptoms was MORE significant.
+- There were no interactions with age or gender
+- Original model fit: AIC = 997, BIC=1015; With white vs. non-white factor: AIC 981, BIC = 1011. So it's truly better.
+```{r}
+### Gender
+lme(bprs_postot ~ demo_gender2*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+### Race
+lme(bprs_postot ~ demo_race2*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+lme(bprs_postot ~ demo_white*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+# Store coefficients
+model <- lme(bprs_postot ~ demo_white*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+coeff_poswhite <- model$coefficients$fixed
+```
+```{r, echo=FALSE}
+### S1A White/Caucasian - pos s/s ###
+figdat.white <- filter(lp.medium, demo_white==1)
+
+# 2-layer function where f=feature and t=timepoint, w=white
+w = 1 
+fx_linearlmm <- function(f) {
+      function(t) {coeff_poswhite[1] + coeff_poswhite[2]*w + coeff_poswhite[3]*f + 
+                  coeff_poswhite[4]*t + coeff_poswhite[5]*w*f + coeff_poswhite[6]*w*t +
+                  coeff_poswhite[7]*t*f + coeff_poswhite[8]*w*t*f}
+}
+
+# f values which we are plotting - copy this
+f_args = c(-2, -1, 0, 1, 2)
+
+# Constructing the dataset to draw the predicted lines from
+in_1 <- data.frame(t = 0:3)
+in_2 <- mutate(in_1, 
+               across(t, map(f_args, ~ fx_linearlmm(f=.)))
+)
+predicted <- pivot_longer(in_2, cols = -t)
+
+# Plot
+ggplot() +
+      geom_point(data = figdat.white, 
+                 aes(x=timepoint, y=bprs_postot, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = figdat.white,
+                aes(x=timepoint, y=bprs_postot, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", linewidth = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Positive Symptoms", 
+           title = "Component Score & Pos. s/s for White/Caucasian Participants") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+
+### S1B NON-White/Caucasian - pos s/s ###
+figdat.nonwhite <- filter(lp.medium, demo_white==0)
+
+# 2-layer function where f=feature and t=timepoint, w=white
+w = 0
+fx_linearlmm <- function(f) {
+      function(t) {coeff_poswhite[1] + coeff_poswhite[2]*w + coeff_poswhite[3]*f + 
+                  coeff_poswhite[4]*t + coeff_poswhite[5]*w*f + coeff_poswhite[6]*w*t +
+                  coeff_poswhite[7]*t*f + coeff_poswhite[8]*w*t*f}
+}
+
+# f values which we are plotting - copy this
+f_args = c(-2, -1, 0, 1, 2)
+
+# Constructing the dataset to draw the predicted lines from
+in_1 <- data.frame(t = 0:3)
+in_2 <- mutate(in_1, 
+               across(t, map(f_args, ~ fx_linearlmm(f=.)))
+)
+predicted <- pivot_longer(in_2, cols = -t)
+
+# Plot
+ggplot() +
+      geom_point(data = figdat.nonwhite, 
+                 aes(x=timepoint, y=bprs_postot, group=grid),
+                 alpha = 0.6, color = "mediumpurple") +
+      geom_line(data = figdat.nonwhite,
+                aes(x=timepoint, y=bprs_postot, group=grid),
+                alpha = 0.6, color="mediumpurple4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", linewidth = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="BPRS Positive Symptoms", 
+           title = "Component Score & Pos. s/s for Non-White/Non-Caucasian Participants") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+```
+
+
+## 6B) Negative symptoms
+- White race had a significant interaction on the interaction between the speech features and timepoint
+- There were no interactions with age or gender
+- Original model: BIC linear = 861.8/AIC=843.5, vs. with white vs. non-white: AIC = 840, BIC = 870. So it's equivocal as to whether this is better.
+```{r}
+### Gender
+lme(sans_tot_global ~ demo_gender2*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+### Race
+lme(sans_tot_global ~ demo_race2*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+lme(sans_tot_global ~ demo_white*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+# Store coefficients
+model <- lme(sans_tot_global ~ demo_white*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+coeff_negwhite <- model$coefficients$fixed
+
+```
+```{r, echo=FALSE}
+### S2A White/Caucasian - NEG s/s ###
+# 2-layer function where f=feature and t=timepoint, w=white
+w = 1 
+fx_linearlmm <- function(f) {
+      function(t) {coeff_negwhite[1] + coeff_negwhite[2]*w + coeff_negwhite[3]*f + 
+                  coeff_negwhite[4]*t + coeff_negwhite[5]*w*f + coeff_negwhite[6]*w*t +
+                  coeff_negwhite[7]*t*f + coeff_negwhite[8]*w*t*f}
+}
+
+# f values which we are plotting - copy this
+f_args = c(-2, -1, 0, 1, 2)
+
+# Constructing the dataset to draw the predicted lines from
+in_1 <- data.frame(t = 0:3)
+in_2 <- mutate(in_1, 
+               across(t, map(f_args, ~ fx_linearlmm(f=.)))
+)
+predicted <- pivot_longer(in_2, cols = -t)
+
+# Plot
+ggplot() +
+      geom_point(data = figdat.white, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = figdat.white,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms",
+           title = "Component Score & Neg. s/s for White/Caucasian Participants") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+
+
+
+### S2B Non-White/Caucasian - NEG s/s ###
+# 2-layer function where f=feature and t=timepoint, w=white
+w = 0
+fx_linearlmm <- function(f) {
+      function(t) {coeff_negwhite[1] + coeff_negwhite[2]*w + coeff_negwhite[3]*f + 
+                  coeff_negwhite[4]*t + coeff_negwhite[5]*w*f + coeff_negwhite[6]*w*t +
+                  coeff_negwhite[7]*t*f + coeff_negwhite[8]*w*t*f}
+}
+
+# f values which we are plotting - copy this
+f_args = c(-2, -1, 0, 1, 2)
+
+# Constructing the dataset to draw the predicted lines from
+in_1 <- data.frame(t = 0:3)
+in_2 <- mutate(in_1, 
+               across(t, map(f_args, ~ fx_linearlmm(f=.)))
+)
+predicted <- pivot_longer(in_2, cols = -t)
+
+# Plot
+ggplot() +
+      geom_point(data = figdat.nonwhite, 
+                 aes(x=timepoint, y=sans_tot_global, group=grid),
+                 alpha = 0.6, color = "royalblue") +
+      geom_line(data = figdat.nonwhite,
+                aes(x=timepoint, y=sans_tot_global, group=grid),
+                alpha = 0.6, color="royalblue4", linetype = "dotted") +
+      geom_line(data=predicted, 
+                aes(x=t, y=value, color=name),
+                linetype = "solid", size = 1.2) +
+      theme_few() +
+      labs(x="Timepoint", y="SANS Negative Symptoms",
+           title = "Component Score & Neg. s/s for Non-White/Non-Caucasian Participants") +
+      scale_color_manual(name = "Feature Contours",
+                         labels = c("z = -2", "z = -1", "z = 0", "z = 1", "z = 2"),
+                         values = c("goldenrod2", "orangered", "red2", "firebrick", "maroon4"))
+```
+
+
+## 6A) TD symptoms
+- There were no significant interaction effects with the Component score for gender, or race
+- Significant interaction with age
+- Original model: AIC 1212, BIC = 1230; vs. with age as categorical variable, it's better: AIC 1178, BIC 1220.
+```{r}
+### Gender
+lme(tlc_sum ~ demo_gender2*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+
+### Race
+lme(tlc_sum ~ demo_race2*C.single.medium*timepoint, data = lp.medium, random = ~1 | grid, na.action = "na.omit") %>% summary()
+```
+
+## Explore for reveiwer
+```{r}
+# average embedding distance vs. TD?
+cor.test(lp.medium$local_coherence_Google_300_avg_dist_PIC, lp.medium$tlc_sum)
+
+# Pairwise timepoint effects for symptoms
+pairwise.t.test(lp.medium$tlc_sum, lp.medium$timepoint, p.adjust.method = "fdr")
+pairwise.t.test(lp.medium$bprs_postot, lp.medium$timepoint, p.adjust.method = "fdr")
+```
+
+
+## Save outputs
+```{r, include = FALSE}
+# Data
+save(lp.medium, file="lp.medium.R")
+```
+
